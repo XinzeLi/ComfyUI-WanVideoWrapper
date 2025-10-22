@@ -1103,6 +1103,10 @@ class WanAttentionBlock(nn.Module):
                 q, k = apply_rope_comfy(q, k, freqs)
             elif self.rope_func == "comfy_chunked":
                 q, k = apply_rope_comfy_chunked(q, k, freqs)
+            elif self.rope_func == "mocha":
+                from ...mocha.nodes import rope_apply_mocha
+                q=rope_apply_mocha(q, grid_sizes, freqs)
+                k=rope_apply_mocha(k, grid_sizes, freqs)
             else:
                 q = rope_apply(q, grid_sizes, freqs, reverse_time=reverse_time)
                 k = rope_apply(k, grid_sizes, freqs, reverse_time=reverse_time)
@@ -2153,6 +2157,7 @@ class WanModel(torch.nn.Module):
         wananim_pose_strength=1.0, wananim_face_strength=1.0,
         lynx_embeds=None,
         x_ovi=None, seq_len_ovi=None, ovi_negative_text_embeds=None,
+        flashvsr_LQ_latent=None, flashvsr_strength=1.0,
     ):
         r"""
         Forward pass through the diffusion model
@@ -2807,6 +2812,9 @@ class WanModel(torch.nn.Module):
                     lynx_ref_feature = lynx_ref_buffer.get(block_idx, None)
                 else:
                     lynx_ref_feature = None
+                # FlashVSR
+                if flashvsr_LQ_latent is not None and b < len(flashvsr_LQ_latent):
+                    x += flashvsr_LQ_latent[b].to(x) * flashvsr_strength
                 # Prefetch blocks if enabled
                 if self.prefetch_blocks > 0:
                     for prefetch_offset in range(1, self.prefetch_blocks + 1):

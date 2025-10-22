@@ -1837,8 +1837,15 @@ class WanVideoScheduler: #WIP
                 # Annotate each sigma value
                 ax.scatter(x_values, sigmas_np, color='white', s=20, zorder=3)  # Small dots at each sigma
                 for x, y in zip(x_values, sigmas_np):
-                    if len(sigmas_np) <= 10:  # Only annotate if few steps
-                        ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points", xytext=(10, 1), ha='center', color='orange', fontsize=12)
+                    # Show all annotations if few steps, or just show split step annotations
+                    show_annotation = len(sigmas_np) <= 10
+                    is_split_step = (start_idx > 0 and x == start_idx) or (end_idx != -1 and x == end_idx + 1)
+                    
+                    if show_annotation or is_split_step:
+                        color = 'orange'
+                        if is_split_step:
+                            color = 'yellow'
+                        ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points", xytext=(10, 1), ha='center', color=color, fontsize=12)
                 ax.set_xticks(x_values)
                 ax.set_title("Sigmas", color='white')           # Title font color
                 ax.set_xlabel("Step", color='white')            # X label font color
@@ -1997,6 +2004,8 @@ class WanVideoDecode:
         drop_last = samples.get("drop_last", False)
         is_looped = samples.get("looped", False)
 
+        flashvsr_LQ_images = samples.get("flashvsr_LQ_images", None)
+
         vae.to(device)
 
         latents = latents.to(device = device, dtype = vae.dtype)
@@ -2009,7 +2018,7 @@ class WanVideoDecode:
             latents = latents[:, :, :-1]
 
         if type(vae).__name__ == "TAEHV":      
-            images = vae.decode_video(latents.permute(0, 2, 1, 3, 4))[0].permute(1, 0, 2, 3)
+            images = vae.decode_video(latents.permute(0, 2, 1, 3, 4), cond=flashvsr_LQ_images.to(vae.dtype) if flashvsr_LQ_images is not None else None)[0].permute(1, 0, 2, 3)
             images = torch.clamp(images, 0.0, 1.0)
             images = images.permute(1, 2, 3, 0).cpu().float()
             return (images,)

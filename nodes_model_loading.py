@@ -130,6 +130,8 @@ def standardize_lora_key_format(lora_sd):
             k = k.replace('pipe.dit.', 'diffusion_model.')
         if k.startswith('blocks.'):
             k = k.replace('blocks.', 'diffusion_model.blocks.')
+        if k.startswith('vace_blocks.'):
+            k = k.replace('vace_blocks.', 'diffusion_model.vace_blocks.')
         k = k.replace('.default.', '.')
 
         # Fun LoRA format
@@ -328,6 +330,7 @@ class WanVideoTorchCompileSettings:
             },
             "optional": {
                 "dynamo_recompile_limit": ("INT", {"default": 128, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.recompile_limit"}),
+                "force_parameter_static_shapes": ("BOOLEAN", {"default": True, "tooltip": "torch._dynamo.config.force_parameter_static_shapes"}),
             },
         }
     RETURN_TYPES = ("WANCOMPILEARGS",)
@@ -336,7 +339,7 @@ class WanVideoTorchCompileSettings:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "torch.compile settings, when connected to the model loader, torch.compile of the selected layers is attempted. Requires Triton and torch > 2.7.0 is recommended"
 
-    def set_args(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, dynamo_recompile_limit=128):
+    def set_args(self, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, dynamo_recompile_limit=128, force_parameter_static_shapes=True):
 
         compile_args = {
             "backend": backend,
@@ -346,6 +349,7 @@ class WanVideoTorchCompileSettings:
             "dynamo_cache_size_limit": dynamo_cache_size_limit,
             "dynamo_recompile_limit": dynamo_recompile_limit,
             "compile_transformer_blocks_only": compile_transformer_blocks_only,
+            "force_parameter_static_shapes": force_parameter_static_shapes,
         }
 
         return (compile_args, )
@@ -1046,6 +1050,7 @@ class WanVideoModelLoader:
                     "sageattn",
                     "sageattn_3",
                     "radial_sage_attention",
+                    "sageattn_compiled",
                     ], {"default": "sdpa"}),
                 "compile_args": ("WANCOMPILEARGS", ),
                 "block_swap_args": ("BLOCKSWAPARGS", ),
@@ -1135,29 +1140,45 @@ class WanVideoModelLoader:
                 if new_key != key:
                     sd[new_key] = sd.pop(key)
 
+        is_scaled_fp8 = False
+
         if quantization == "disabled":
             for k, v in sd.items():
                 if isinstance(v, torch.Tensor):
                     if v.dtype == torch.float8_e4m3fn:
                         quantization = "fp8_e4m3fn"
                         if "scaled_fp8" in sd:
+                            is_scaled_fp8 = True
                             quantization = "fp8_e4m3fn_scaled"
                         break
                     elif v.dtype == torch.float8_e5m2:
                         quantization = "fp8_e5m2"
                         if "scaled_fp8" in sd:
+                            is_scaled_fp8 = True
                             quantization = "fp8_e5m2_scaled"
                         break
-        
+
+        scale_weights = {}
+        if "fp8" in quantization:
+            for k, v in sd.items():
+                if k.endswith(".scale_weight"):
+                    is_scaled_fp8 = True
+                    break
+
+        if is_scaled_fp8 and "scaled" not in quantization:
+            quantization = quantization + "_scaled"
+
         if torch.cuda.is_available():
             #only warning for now
             major, minor = torch.cuda.get_device_capability(device)
             log.info(f"CUDA Compute Capability: {major}.{minor}")
             if compile_args is not None and "e4" in quantization and (major, minor) < (8, 9):
-                log.warning("WARNING: Torch.compile with fp8_e4m3fn weights on CUDA compute capability < 8.9 is not supported. Please use fp8_e5m2, GGUF or higher precision instead.")
+                log.warning("WARNING: Torch.compile with fp8_e4m3fn weights on CUDA compute capability < 8.9 may not be supported. Please use fp8_e5m2, GGUF or higher precision instead, or check the latest triton version that adds support for older architectures https://github.com/woct0rdho/triton-windows/releases/tag/v3.5.0-windows.post21")
 
-        if "scaled_fp8" in sd and "scaled" not in quantization:
+        if is_scaled_fp8 and "scaled" not in quantization:
             raise ValueError("The model is a scaled fp8 model, please set quantization to '_scaled'")
+        if not is_scaled_fp8 and "scaled" in quantization:
+            raise ValueError("The model is not a scaled fp8 model, please disable '_scaled' in quantization")
 
         if "vace_blocks.0.after_proj.weight" in sd and not "patch_embedding.weight" in sd:
             raise ValueError("You are attempting to load a VACE module as a WanVideo model, instead you should use the vace_model input and matching T2V base model")
@@ -1474,6 +1495,12 @@ class WanVideoModelLoader:
             sd.update(extra_sd)
             del extra_sd
 
+        # FlashVSR
+        if "LQ_proj_in.norm1.gamma" in sd:
+            log.info("FlashVSR model detected, patching model...")
+            from .FlashVSR.LQ_proj_model import Buffer_LQ4x_Proj
+            transformer.LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1)
+
         # Additional cond latents
         if "add_conv_in.weight" in sd:
             def zero_module(module):
@@ -1505,9 +1532,9 @@ class WanVideoModelLoader:
                 if k.endswith(".scale_weight"):
                     scale_weights[k] = v.to(device, base_dtype)
 
-        if quantization == "fp8_e4m3fn":
+        if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast"]:
             weight_dtype = torch.float8_e4m3fn
-        elif quantization == "fp8_e5m2":
+        elif quantization in ["fp8_e5m2", "fp8_e5m2_fast"]:
             weight_dtype = torch.float8_e5m2
         else:
             weight_dtype = base_dtype
