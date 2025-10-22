@@ -189,29 +189,29 @@ class WanVideoSampler:
         vae_upscale_factor = 16 if is_5b else 8
 
         # Load weights
-        if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0:
-            transformer = _replace_linear(transformer, dtype, patcher.model["sd"])
-            transformer.patched_linear = True
-        if patcher.model["sd"] is not None and gguf_reader is None:
-            load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
+        # if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0:
+        #     transformer = _replace_linear(transformer, dtype, patcher.model["sd"])
+        #     transformer.patched_linear = True
+        # if patcher.model["sd"] is not None and gguf_reader is None:
+        #     load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
 
-        if gguf_reader is not None: #handle GGUF
-            load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
-            set_lora_params_gguf(transformer, patcher.patches)
-            transformer.patched_linear = True
-        elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
-            log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
-            if not merge_loras and fp8_matmul:
-                raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
-            set_lora_params(transformer, patcher.patches)
-        else:
-            remove_lora_from_module(transformer) #clear possible unmerged lora weights
+        # if gguf_reader is not None: #handle GGUF
+        #     load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
+        #     set_lora_params_gguf(transformer, patcher.patches)
+        #     transformer.patched_linear = True
+        # elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
+        #     log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
+        #     if not merge_loras and fp8_matmul:
+        #         raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
+        #     set_lora_params(transformer, patcher.patches)
+        # else:
+        #     remove_lora_from_module(transformer) #clear possible unmerged lora weights
 
-        transformer.lora_scheduling_enabled = transformer_options.get("lora_scheduling_enabled", False)
+        # transformer.lora_scheduling_enabled = transformer_options.get("lora_scheduling_enabled", False)
 
         #torch.compile
-        if model["auto_cpu_offload"] is False:
-            transformer = compile_model(transformer, model["compile_args"])
+        # if model["auto_cpu_offload"] is False:
+        #     transformer = compile_model(transformer, model["compile_args"])
 
         multitalk_sampling = image_embeds.get("multitalk_sampling", False)
 
@@ -834,15 +834,15 @@ class WanVideoSampler:
 
         #controlnet
         controlnet_latents = controlnet = None
-        if transformer_options is not None:
-            controlnet = transformer_options.get("controlnet", None)
-            if controlnet is not None:
-                self.controlnet = controlnet["controlnet"]
-                controlnet_start = controlnet["controlnet_start"]
-                controlnet_end = controlnet["controlnet_end"]
-                controlnet_latents = controlnet["control_latents"]
-                controlnet["controlnet_weight"] = controlnet["controlnet_strength"]
-                controlnet["controlnet_stride"] = controlnet["control_stride"]
+        # if transformer_options is not None:
+        #     controlnet = transformer_options.get("controlnet", None)
+        #     if controlnet is not None:
+        #         self.controlnet = controlnet["controlnet"]
+        #         controlnet_start = controlnet["controlnet_start"]
+        #         controlnet_end = controlnet["controlnet_end"]
+        #         controlnet_latents = controlnet["control_latents"]
+        #         controlnet["controlnet_weight"] = controlnet["controlnet_strength"]
+        #         controlnet["controlnet_stride"] = controlnet["control_stride"]
 
         #uni3c
         uni3c_data = uni3c_data_input = None
@@ -889,7 +889,7 @@ class WanVideoSampler:
         gc.collect()
 
         #blockswap init
-        init_blockswap(transformer, block_swap_args, model)
+        # init_blockswap(transformer, block_swap_args, model)
 
         # Initialize Cache if enabled
         previous_cache_states = None
@@ -927,8 +927,8 @@ class WanVideoSampler:
             transformer.slg_blocks = None
 
         # Setup radial attention
-        if transformer.attention_mode == "radial_sage_attention":
-            setup_radial_attention(transformer, transformer_options, latent, seq_len, latent_video_length, context_options=context_options)
+        # if transformer.attention_mode == "radial_sage_attention":
+        #     setup_radial_attention(transformer, transformer_options, latent, seq_len, latent_video_length, context_options=context_options)
 
         # FlowEdit setup
         if flowedit_args is not None:
@@ -1478,7 +1478,8 @@ class WanVideoSampler:
                     log.error(f"Error during model prediction: {e}")
                     if force_offload:
                         if not model["auto_cpu_offload"]:
-                            offload_transformer(transformer)
+                            # offload_transformer(transformer)
+                            pass
                     raise e
 
                 #https://github.com/WeichenFan/CFG-Zero-star/
@@ -1610,7 +1611,51 @@ class WanVideoSampler:
             try:
                 pbar = ProgressBar(len(timesteps))
                 #region main loop start
+                # start here!
+                if not wananimate_loop:
+                    from comfybridge.bizyair import remote_call
+                    faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
+                    headers = {
+                        "Authorization": f"Bearer {faas_token}"
+                        }
+
+                    base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
+                    endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
+                    latent = remote_call(
+                            base_url=base_url,
+                            endpoint_path=endpoint_path,
+                            kwargs={
+                                'model': model.pipeline,
+                                'seed': seed,
+                                'steps': steps,
+                                'cfg': cfg,
+                                'sampler_name': None,
+                                'scheduler': scheduler,
+                                'positive_prompt_embeds': text_embeds["prompt_embeds"][0].unsqueeze(0).contiguous(),
+                                'negative_prompt_embeds': text_embeds["negative_prompt_embeds"][0].unsqueeze(0).contiguous(),
+                                'penultimate_hidden_states': clip_fea.contiguous(),
+                                "pose_video_latent": wananim_pose_latents.contiguous(),
+                                "pose_strength": wananim_pose_strength,
+                                "face_video_pixels": wananim_face_pixels.contiguous(),
+                                "face_strength": wananim_face_strength,
+                                "concat_latent_image": image_cond[4:].unsqueeze(0).contiguous(),
+                                'concat_mask': (1.0 - image_cond[:4]).unsqueeze(0).contiguous(),
+                                'latent': {"samples": latent.unsqueeze(0).contiguous()},
+                                'denoise': None,
+                                'disable_noise': True,
+                                'start_step': start_step,
+                                'last_step': end_step,
+                                'force_full_denoise': add_noise_to_samples,
+                                "enable_preprocess": False,
+                                "enable_postprocess": False,
+                                "shift": shift,
+                            },
+                            headers=headers
+                        )['data']['payload']
+                
                 for idx, t in enumerate(tqdm(timesteps, disable=multitalk_sampling or wananimate_loop)):
+                    if not wananimate_loop:
+                        break
                     if flowedit_args is not None:
                         if idx < skip_steps:
                             continue
@@ -2301,7 +2346,7 @@ class WanVideoSampler:
 
                             del noise, latent_motion_frames
                             if offload:
-                                offload_transformer(transformer)
+                                # offload_transformer(transformer)
                                 offloaded = True
                             if humo_image_cond is not None and humo_reference_count > 0:
                                 latent = latent[:,:-humo_reference_count]
@@ -2394,7 +2439,8 @@ class WanVideoSampler:
 
                         if force_offload:
                             if not model["auto_cpu_offload"]:
-                                offload_transformer(transformer)
+                                # offload_transformer(transformer)
+                                pass
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
@@ -2532,7 +2578,8 @@ class WanVideoSampler:
 
                         if force_offload:
                             if not model["auto_cpu_offload"]:
-                                offload_transformer(transformer)
+                                # offload_transformer(transformer)
+                                pass
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
@@ -2605,7 +2652,7 @@ class WanVideoSampler:
 
                             if ref_latent is not None:
                                 if offload:
-                                    offload_transformer(transformer)
+                                    # offload_transformer(transformer)
                                     offloaded = True
                                 vae.to(device)
                                 if wananim_ref_masks is not None:
@@ -2729,7 +2776,50 @@ class WanVideoSampler:
                             gc.collect()
                             # inner WanAnimate sampling loop
                             sampling_pbar = tqdm(total=len(timesteps), desc=f"Frames {start}-{end}", position=0, leave=True)
+                            from comfybridge.bizyair import remote_call
+                            faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
+                            headers = {
+                                "Authorization": f"Bearer {faas_token}"
+                            }
+
+                            base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
+                            endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
+                            latent = remote_call(
+                                base_url=base_url,
+                                endpoint_path=endpoint_path,
+                                kwargs={
+                                    'model': model.pipeline,
+                                    'seed': seed,
+                                    'steps': steps,
+                                    'cfg': cfg,
+                                    'sampler_name': None,
+                                    'scheduler': scheduler,
+                                    'positive_prompt_embeds': text_embeds["prompt_embeds"][0].unsqueeze(0).contiguous(),
+                                    'negative_prompt_embeds': text_embeds["negative_prompt_embeds"][0].unsqueeze(0).contiguous(),
+                                    'penultimate_hidden_states': clip_fea.contiguous(),
+                                    # "pose_video_latent": wananim_pose_latents.contiguous(),
+                                    "pose_video_latent": pose_input_slice.contiguous(),
+                                    "pose_strength": wananim_pose_strength,
+                                    # "face_video_pixels": wananim_face_pixels.contiguous(),
+                                    "face_video_pixels": face_images_in.contiguous(),
+                                    "face_strength": wananim_face_strength,
+                                    "concat_latent_image": image_cond_in[4:].unsqueeze(0).contiguous(),
+                                    'concat_mask': (1.0 - image_cond_in[:4]).unsqueeze(0).contiguous(),
+                                    'latent': {"samples": latent.unsqueeze(0).contiguous()},
+                                    'denoise': None,
+                                    'disable_noise': True,
+                                    'start_step': start_step,
+                                    'last_step': end_step,
+                                    'force_full_denoise': add_noise_to_samples,
+                                    "enable_preprocess": False,
+                                    "enable_postprocess": False,
+                                    "shift": shift,
+                                },
+                                headers=headers
+                            )['data']['payload']
+                            latent = latent[0]["samples"].squeeze(0)
                             for i in range(len(timesteps)):
+                                break
                                 timestep = timesteps[i]
                                 latent_model_input = latent.to(device)
 
@@ -2761,7 +2851,7 @@ class WanVideoSampler:
 
                             del noise
                             if offload:
-                                offload_transformer(transformer)
+                                # offload_transformer(transformer)
                                 offloaded = True
 
                             vae.to(device)
@@ -2815,8 +2905,8 @@ class WanVideoSampler:
 
                         if force_offload:
                             vae.to(offload_device)
-                            if not model["auto_cpu_offload"]:
-                                offload_transformer(transformer)
+                            # if not model["auto_cpu_offload"]:
+                            #     offload_transformer(transformer)
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
@@ -2936,9 +3026,9 @@ class WanVideoSampler:
                             pbar.update(1)
             except Exception as e:
                 log.error(f"Error during sampling: {e}")
-                if force_offload:
-                    if not model["auto_cpu_offload"]:
-                        offload_transformer(transformer)
+                # if force_offload:
+                #     if not model["auto_cpu_offload"]:
+                #         offload_transformer(transformer)
                 raise e
 
         if phantom_latents is not None:
@@ -2957,17 +3047,30 @@ class WanVideoSampler:
                     "magcache_state": transformer.magcache_state,
                 }
 
-        if force_offload:
-            if not model["auto_cpu_offload"]:
-                offload_transformer(transformer)
+        # if force_offload:
+        #     if not model["auto_cpu_offload"]:
+        #         offload_transformer(transformer)
 
-        try:
-            print_memory(device)
-            #torch.cuda.memory._dump_snapshot("wanvideowrapper_memory_dump.pt")
-            #torch.cuda.memory._record_memory_history(enabled=None)
-            torch.cuda.reset_peak_memory_stats(device)
-        except:
-            pass
+        # try:
+        #     print_memory(device)
+        #     #torch.cuda.memory._dump_snapshot("wanvideowrapper_memory_dump.pt")
+        #     #torch.cuda.memory._record_memory_history(enabled=None)
+        #     torch.cuda.reset_peak_memory_stats(device)
+        # except:
+        #     pass
+        return ({
+            "samples": latent[0]["samples"].float().cpu(),
+            "looped": is_looped,
+            "end_image": end_image if not fun_or_fl2v_model else None,
+            "has_ref": has_ref,
+            "drop_last": drop_last,
+            "generator_state": seed_g.get_state(),
+            "original_image": None,
+            "cache_states": cache_states,
+            "latent_ovi_audio": latent_ovi.unsqueeze(0).transpose(1, 2).cpu() if latent_ovi is not None else None,
+        },{
+            "samples": None,
+        })
         return ({
             "samples": latent.unsqueeze(0).cpu(),
             "looped": is_looped,

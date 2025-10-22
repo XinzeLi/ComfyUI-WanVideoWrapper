@@ -5,6 +5,8 @@ from .utils import log, apply_lora
 import numpy as np
 from tqdm import tqdm
 import re
+import safetensors
+import safetensors.torch
 
 from .wanvideo.modules.model import WanModel, LoRALinearLayer
 from .wanvideo.modules.t5 import T5EncoderModel
@@ -519,6 +521,29 @@ class WanVideoLoraSelectMulti:
             (lora_3, strength_3),
             (lora_4, strength_4)
         ]
+        from comfybridge.bizyair import remote_call
+        faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
+        headers = {
+            "Authorization": f"Bearer {faas_token}"
+            }
+
+        base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
+        endpoint_path = os.getenv("WAN22_LORA_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
+        for lora_name, strength in lora_inputs:
+            if lora_name == "none":
+                continue
+            lora_path = folder_paths.get_full_path("loras", lora_name)
+            sd = safetensors.torch.load_file(lora_path)
+            remote_call(
+                base_url=base_url,
+                endpoint_path=endpoint_path,
+                kwargs={
+                    "lora_name": lora_name,
+                    "sd": sd,
+                },
+                headers=headers
+            )['data']['payload']
+        return (lora_inputs, )
         for lora_name, strength in lora_inputs:
             s = round(strength, 4) if not isinstance(strength, list) else strength
             if not lora_name or lora_name == "none" or s == 0.0:
@@ -723,7 +748,30 @@ class WanVideoSetLoRAs:
     def setlora(self, model, lora=None):
         if lora is None:
             return (model,)
-        
+        import copy, math
+        model_copy = copy.deepcopy(model)
+        for l in lora:
+            lora_name, strength_model = l
+            if lora_name == "none" or strength_model == 0:
+                continue
+            if model_copy.model.pipeline.get("lora_name") is None:
+                model_copy.model["lora_name"] = []
+                model_copy.model["lora_name"].append(lora_name + "@" + str(strength_model))
+            else:
+                match_flag = False
+                for i, lora_id in enumerate(model_copy.model["lora_name"]):
+                    if lora_id.startswith(lora_name):
+                        match_flag = True
+                        _, strength = lora_id.rsplit("@")
+                        strength = str(float(strength) + strength_model)
+                        if math.isclose(float(strength), 0.0):
+                            model_copy.model["lora_name"].pop(i)
+                        else:
+                            model_copy.model["lora_name"][i] = lora_name + "@" + str(strength)
+                        break
+                if match_flag == False:
+                    model_copy.model["lora_name"].append(lora_name + "@" + str(strength_model))
+        return (model_copy, )
         patcher = model.clone()
         
         merge_loras = False
@@ -1020,6 +1068,8 @@ class WanVideoModelLoader:
                   compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, extra_model=None, vace_model=None,
                   fantasytalking_model=None, multitalk_model=None, fantasyportrait_model=None, rms_norm_function="default"):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
+        # lixinze: hard coding load device.
+        load_device = "offload_device"
         if vace_model is not None:
             extra_model = vace_model
         lora_low_mem_load = merge_loras = False
@@ -1564,7 +1614,9 @@ class WanVideoModelLoader:
         patcher.model["gguf_reader"] = gguf_reader
         patcher.model["fp8_matmul"] = "fast" in quantization
         patcher.model["scale_weights"] = scale_weights
-        patcher.model["sd"] = sd
+        # patcher.model["sd"] = sd
+        patcher.model["sd"] = None
+        del sd
         patcher.model["lora"] = lora
 
         if 'transformer_options' not in patcher.model_options:
