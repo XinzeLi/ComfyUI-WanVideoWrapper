@@ -530,23 +530,53 @@ class WanVideoLoraSelectMulti:
         headers = {
             "Authorization": f"Bearer {faas_token}"
             }
-
-        base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
+        base_url = None
+        base_high_url = None
+        base_low_url = None
+        if os.getenv("WAN_DIT_TYPE") == "wan22_s2v":
+            base_url = os.getenv("WAN22_S2V_URL", "http://localhost:8392")
+        elif os.getenv("WAN_DIT_TYPE") == "wan22_animate":
+            base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
+        elif os.getenv("WAN_DIT_TYPE") == "wan22_i2v":
+            base_high_url = os.getenv("WAN22_HIGH_BASE_URL", "http://localhost:8192")
+            base_low_url = os.getenv("WAN22_LOW_BASE_URL", "http://localhost:8193")
+        else:
+            raise ValueError(f'Wan DiT type {os.getenv("WAN_DIT_TYPE")} is not supported yet.')
         endpoint_path = os.getenv("WAN22_LORA_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
         for lora_name, strength in lora_inputs:
             if lora_name == "none":
                 continue
             lora_path = folder_paths.get_full_path("loras", lora_name)
             sd = safetensors.torch.load_file(lora_path)
-            remote_call(
-                base_url=base_url,
-                endpoint_path=endpoint_path,
-                kwargs={
-                    "lora_name": lora_name,
-                    "sd": sd,
-                },
-                headers=headers
-            )['data']['payload']
+            if base_url is not None:
+                remote_call(
+                    base_url=base_url,
+                    endpoint_path=endpoint_path,
+                    kwargs={
+                        "lora_name": lora_name,
+                        "sd": sd,
+                    },
+                    headers=headers
+                )['data']['payload']
+            elif base_high_url is not None and base_low_url is not None:
+                remote_call(
+                    base_url=base_high_url,
+                    endpoint_path=endpoint_path,
+                    kwargs={
+                        "lora_name": lora_name,
+                        "sd": sd,
+                    },
+                    headers=headers
+                )['data']['payload']
+                remote_call(
+                    base_url=base_low_url,
+                    endpoint_path=endpoint_path,
+                    kwargs={
+                        "lora_name": lora_name,
+                        "sd": sd,
+                    },
+                    headers=headers
+                )['data']['payload']
         return (lora_inputs, )
         for lora_name, strength in lora_inputs:
             s = round(strength, 4) if not isinstance(strength, list) else strength
