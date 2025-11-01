@@ -189,6 +189,11 @@ class WanVideoSampler:
         vae_upscale_factor = 16 if is_5b else 8
 
         # Load weights
+        if transformer.audio_model is not None:
+            for block in transformer.blocks:
+                if hasattr(block, 'audio_block'):
+                    block.audio_block = None
+
         # if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0:
         #     transformer = _replace_linear(transformer, dtype, patcher.model["sd"])
         #     transformer.patched_linear = True
@@ -995,12 +1000,11 @@ class WanVideoSampler:
         # Experimental args
         use_cfg_zero_star = use_tangential = use_fresca = bidirectional_sampling = use_tsr = False
         raag_alpha = 0.0
+        transformer.video_attention_split_steps = []
         if experimental_args is not None:
             video_attention_split_steps = experimental_args.get("video_attention_split_steps", [])
             if video_attention_split_steps:
-                transformer.video_attention_split_steps = [int(x.strip()) for x in video_attention_split_steps.split(",")]
-            else:
-                transformer.video_attention_split_steps = []
+                transformer.video_attention_split_steps = [int(x.strip()) for x in video_attention_split_steps.split(",")]                
 
             use_zero_init = experimental_args.get("use_zero_init", True)
             use_cfg_zero_star = experimental_args.get("cfg_zero_star", False)
@@ -1396,6 +1400,7 @@ class WanVideoSampler:
                     "ovi_negative_text_embeds": ovi_negative_text_embeds, # Audio latent model negative text embeds for Ovi
                     "flashvsr_LQ_latent": flashvsr_LQ_latent, # FlashVSR LQ latent for upsampling
                     "flashvsr_strength": flashvsr_strength, # FlashVSR strength
+                    "num_cond_latents": len(all_indices) if transformer.is_longcat else None # number of cond latents LongCat to separate attention
                 }
 
                 batch_size = 1
@@ -1760,7 +1765,7 @@ class WanVideoSampler:
                     current_step_percentage = idx / len(timesteps)
 
                     timestep = torch.tensor([t]).to(device)
-                    if is_pusa or (is_5b and all_indices):
+                    if is_pusa or ((is_5b or transformer.is_longcat) and all_indices):
                         orig_timestep = timestep
                         timestep = timestep.unsqueeze(1).repeat(1, latent_video_length)
                         if extra_latents is not None:
@@ -1984,7 +1989,18 @@ class WanVideoSampler:
                                 for vace_entry in vace_data:
                                     partial_context = vace_entry["context"][0][:, c]
                                     if has_ref:
-                                        partial_context[:, 0] = vace_entry["context"][0][:, 0]
+                                        if c[0] != 0 and context_reference_latent is not None:
+                                            if context_reference_latent.shape[0] == 1: #only single extra init latent
+                                                partial_context[16:32, :1] = context_reference_latent[0, :, :1].to(intermediate_device)
+                                            elif context_reference_latent.shape[0] > 1:
+                                                num_extra_inits = context_reference_latent.shape[0]
+                                                section_size = (latent_video_length / num_extra_inits)
+                                                extra_init_index = min(int(max(c) / section_size), num_extra_inits - 1)
+                                                if context_options["verbose"]:
+                                                    log.info(f"extra init image index: {extra_init_index}")
+                                                partial_context[16:32, :1] = context_reference_latent[extra_init_index, :, :1].to(intermediate_device)
+                                        else:
+                                            partial_context[:, 0] = vace_entry["context"][0][:, 0]
 
                                     window_vace_data.append({
                                         "context": [partial_context],
@@ -2310,7 +2326,11 @@ class WanVideoSampler:
                                 timesteps = [torch.tensor([t], device=device) for t in timesteps]
                                 timesteps = [timestep_transform(t, shift=shift, num_timesteps=1000) for t in timesteps]
                             else:
-                                sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas)
+                                if isinstance(scheduler, dict):
+                                    sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
+                                    timesteps = scheduler["timesteps"]
+                                else:
+                                    sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas)
                                 timesteps = [torch.tensor([float(t)], device=device) for t in timesteps] + [torch.tensor([0.], device=device)]
 
                             # sample videos
@@ -2622,7 +2642,11 @@ class WanVideoSampler:
                             if s2v_pose is not None:
                                 s2v_pose_slice = pose_cond_list[r].to(device)
 
-                            sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas)
+                            if isinstance(scheduler, dict):
+                                sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
+                                timesteps = scheduler["timesteps"]
+                            else:
+                                sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas)
 
                             latent = noise.to(device)
                             # start here!
@@ -2868,7 +2892,11 @@ class WanVideoSampler:
                                     thresholds = thresholds.reshape(-1, 1, 1, 1, 1).to(device)
                                     masks = (1-noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device)) > thresholds
 
-                            sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas)
+                            if isinstance(scheduler, dict):
+                                sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
+                                timesteps = scheduler["timesteps"]
+                            else:
+                                sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas)
 
                             # sample videos
                             latent = noise
@@ -3082,7 +3110,10 @@ class WanVideoSampler:
                         if use_tsr:
                             noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
 
-                        if len(timestep.shape) != 1 and not is_pusa: #5b
+                        if transformer.is_longcat:
+                            noise_pred = -noise_pred
+
+                        if len(timestep.shape) != 1 and not is_pusa: #5b and longcat
                             # all_indices is a list of indices to skip
                             total_indices = list(range(latent.shape[1]))
                             process_indices = [i for i in total_indices if i not in all_indices]
@@ -3226,10 +3257,36 @@ class WanVideoSampler:
             "samples": callback_latent.unsqueeze(0).cpu() if callback is not None else None,
         })
 
+class WanVideoSamplerSettings(WanVideoSampler):
+    RETURN_TYPES = ("SAMPLER_ARGS",)
+    RETURN_NAMES = ("sampler_inputs", )
+    DESCRIPTION = "Node to output all settings and inputs for the WanVideoSamplerFromSettings -node"
+    def process(self, *args, **kwargs):
+        import inspect
+        params = inspect.signature(WanVideoSampler.process).parameters
+        args_dict = {name: kwargs.get(name, param.default if param.default is not inspect.Parameter.empty else None)
+                     for name, param in params.items() if name != "self"}
+        return args_dict,
+
+class WanVideoSamplerFromSettings(WanVideoSampler):
+    DESCRIPTION = "Utility node with no other functionality than to look cleaner, useful for the live preview as the main sampler node has become a messy monster"
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sampler_inputs": ("SAMPLER_ARGS",),},
+        }
+
+    def process(self, sampler_inputs):
+        return super().process(**sampler_inputs)
 
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
+    "WanVideoSamplerSettings": WanVideoSamplerSettings,
+    "WanVideoSamplerFromSettings": WanVideoSamplerFromSettings,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
+    "WanVideoSamplerSettings": "WanVideo Sampler Settings",
+    "WanVideoSamplerFromSettings": "WanVideo Sampler From Settings",
 }
