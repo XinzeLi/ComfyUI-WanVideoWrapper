@@ -542,7 +542,7 @@ class WanVideoLoraSelectMulti:
             base_low_url = os.getenv("WAN22_LOW_BASE_URL", "http://localhost:8193")
         else:
             raise ValueError(f'Wan DiT type {os.getenv("WAN_DIT_TYPE")} is not supported yet.')
-        endpoint_path = os.getenv("WAN22_LORA_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
+        endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
         for lora_name, strength in lora_inputs:
             if lora_name == "none":
                 continue

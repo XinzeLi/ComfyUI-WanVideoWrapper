@@ -1676,16 +1676,19 @@ class WanVideoSampler:
                 base_url = None
                 base_high_url = None
                 base_low_url = None
+                from comfy.rpc_strategy import ParameterStrategyFactory
                 if os.getenv("WAN_DIT_TYPE") == "wan22_s2v":
                     base_url = os.getenv("WAN22_S2V_BASE_URL", "http://localhost:8392")
+                    strategy = ParameterStrategyFactory.get_strategy("kj_wan_s2v")
                 elif os.getenv("WAN_DIT_TYPE") == "wan22_animate":
                     base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
+                    strategy = ParameterStrategyFactory.get_strategy("kj_wan_animate")
                 elif os.getenv("WAN_DIT_TYPE") == "wan22_i2v":
                     base_high_url = os.getenv("WAN22_HIGH_BASE_URL", "http://localhost:8192")
                     base_low_url = os.getenv("WAN22_LOW_BASE_URL", "http://localhost:8193")
                 else:
                     raise ValueError(f'Wan DiT type {os.getenv("WAN_DIT_TYPE")} is not supported yet.')
-                from comfy.rpc_strategy import ParameterStrategyFactory
+                # create inputs for strategy method.
                 inputs = {
                     "model": model.pipeline,
                     "seed": seed,
@@ -1704,14 +1707,23 @@ class WanVideoSampler:
                     "end_step": end_step,
                     "add_noise_to_samples": add_noise_to_samples,
                     "shift": shift,
+                    "s2v_audio_input": s2v_audio_input,
+                    "s2v_audio_scale": s2v_audio_scale if s2v_audio_input is not None else 1.0,
+                    "s2v_ref_motion": s2v_ref_motion,
+                    "s2v_pose": s2v_pose,
+                    "s2v_ref_latent": s2v_ref_latent,
                 }
-                if not wananimate_loop:
+                multi_turn = wananimate_loop or framepack
+                if not multi_turn:
                     from comfybridge.bizyair import remote_call
                     faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
                     headers = {
                         "Authorization": f"Bearer {faas_token}"
-                        }
-                    strategy = ParameterStrategyFactory.get_strategy("kj_wan_animate")
+                    }
+                    # if os.getenv("WAN_DIT_TYPE") == "wan22_s2v":
+                    #     strategy = ParameterStrategyFactory.get_strategy("kj_wan_s2v")
+                    # elif os.getenv("WAN_DIT_TYPE") == "wan22_animate":
+                    #     strategy = ParameterStrategyFactory.get_strategy("kj_wan_animate")
                     kwargs = strategy.get_parameters(inputs)
                     # base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
                     endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
@@ -1723,7 +1735,7 @@ class WanVideoSampler:
                         )['data']['payload']
 
                 for idx, t in enumerate(tqdm(timesteps, disable=multitalk_sampling or wananimate_loop)):
-                    if not wananimate_loop:
+                    if not multi_turn:
                         break
                     if flowedit_args is not None:
                         if idx < skip_steps:
@@ -2613,7 +2625,34 @@ class WanVideoSampler:
                             sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas)
 
                             latent = noise.to(device)
+                            # start here!
+                            from comfybridge.bizyair import remote_call
+                            faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
+                            headers = {
+                                "Authorization": f"Bearer {faas_token}"
+                            }
+                            patch = {
+                                "latent": latent,
+                                "s2v_audio_input": s2v_audio_input_slice,
+                                "s2v_ref_motion": input_motion_latents,
+                                "s2v_pose": s2v_pose_slice,
+                                "s2v_ref_latent": s2v_ref_latent,
+                                "s2v_motion_frames": s2v_motion_frames,
+                            }
+                            inputs.update(patch)
+                            strategy = ParameterStrategyFactory.get_strategy("kj_wan_s2v")
+                            kwargs = strategy.get_parameters(inputs)
+                            # base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
+                            endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
+                            latent = remote_call(
+                                base_url=base_url,
+                                endpoint_path=endpoint_path,
+                                kwargs=kwargs,
+                                headers=headers
+                            )['data']['payload']
+                            latent = latent[0]["samples"].squeeze(0)
                             for i, t in enumerate(tqdm(timesteps, desc=f"Sampling audio indices {left_idx}-{right_idx}", position=0)):
+                                break
                                 latent_model_input = latent.to(device)
                                 timestep = torch.tensor([t]).to(device)
                                 noise_pred, _, self.cache_state = predict_with_cfg(
@@ -2637,7 +2676,8 @@ class WanVideoSampler:
 
 
                             vae.to(device)
-                            decode_latents = torch.cat([ref_motion.unsqueeze(0), latent.unsqueeze(0)], dim=2)
+                            print(f"ref motion shape is {ref_motion.unsqueeze(0).shape}, latent shape is {latent.unsqueeze(0).shape}")
+                            decode_latents = torch.cat([ref_motion.unsqueeze(0).to(device), latent.unsqueeze(0).to(device)], dim=2)
                             image = vae.decode(decode_latents.to(device, vae.dtype), device=device, pbar=False)[0]
                             del decode_latents
                             image = image.unsqueeze(0)[:, :, -infer_frames:]
@@ -2876,7 +2916,6 @@ class WanVideoSampler:
                                 "wananim_face_pixels": face_images_in,
                                 "image_cond": image_cond_in,
                             }
-                            print(f"latent shape is {latent.shape}")
                             inputs.update(patch)
                             strategy = ParameterStrategyFactory.get_strategy("kj_wan_animate")
                             kwargs = strategy.get_parameters(inputs)
