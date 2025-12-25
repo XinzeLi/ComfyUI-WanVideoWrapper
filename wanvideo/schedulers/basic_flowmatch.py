@@ -41,7 +41,7 @@ class FlowMatchScheduler():
                 (num_inference_steps / y_shifted.sum())
             self.linear_timesteps_weights = bsmntw_weighing
 
-    def step(self, model_output, timestep, sample, to_final=False):
+    def step(self, model_output, timestep, sample, to_final=False, **kwargs):
         if timestep.ndim == 2:
             timestep = timestep.flatten(0, 1)
         self.sigmas = self.sigmas.to(model_output.device)

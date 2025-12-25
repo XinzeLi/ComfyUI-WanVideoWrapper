@@ -384,14 +384,69 @@ class WanVideoLoraSelect:
     def getlorapath(self, lora, strength, unique_id, blocks={}, prev_lora=None, low_mem_load=False, merge_loras=True):
         if not merge_loras:
             low_mem_load = False  # Unmerged LoRAs don't need low_mem_load
-        loras_list = []
-
-        if not isinstance(strength, list):
-            strength = round(strength, 4)
-            if strength == 0.0:
-                if prev_lora is not None:
-                    loras_list.extend(prev_lora)
-                return (loras_list,)
+        # loras_list = []
+        loras_list = [(lora, strength)]
+        from comfybridge.bizyair import remote_call
+        import math
+        faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
+        headers = {
+            "Authorization": f"Bearer {faas_token}"
+            }
+        base_url = None
+        base_high_url = None
+        base_low_url = None
+        if os.getenv("WAN_DIT_TYPE") == "wan22_s2v":
+            base_url = os.getenv("WAN22_S2V_BASE_URL", "http://localhost:8392")
+        elif os.getenv("WAN_DIT_TYPE") == "wan22_animate":
+            base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
+        elif os.getenv("WAN_DIT_TYPE") == "wan22_i2v":
+            base_high_url = os.getenv("WAN22_HIGH_BASE_URL", "http://localhost:8192")
+            base_low_url = os.getenv("WAN22_LOW_BASE_URL", "http://localhost:8193")
+        elif os.getenv("WAN_DIT_TYPE") == "wan22_infinitetalk":
+            base_url = os.getenv("WAN22_INFINITETALK_BASE_URL", "http://localhost:8334")
+        else:
+            raise ValueError(f'Wan DiT type {os.getenv("WAN_DIT_TYPE")} is not supported yet.')
+        endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
+        lora_name = lora
+        if lora_name != "none":
+            lora_path = folder_paths.get_full_path("loras", lora_name)
+            sd = safetensors.torch.load_file(lora_path)
+            if base_url is not None:
+                remote_call(
+                    base_url=base_url,
+                    endpoint_path=endpoint_path,
+                    kwargs={
+                        "lora_name": lora_name,
+                        "sd": sd,
+                    },
+                    headers=headers
+                )['data']['payload']
+            elif base_high_url is not None and base_low_url is not None:
+                remote_call(
+                    base_url=base_high_url,
+                    endpoint_path=endpoint_path,
+                    kwargs={
+                        "lora_name": "high_noise_" + lora_name,
+                        "sd": sd,
+                    },
+                    headers=headers
+                )['data']['payload']
+                remote_call(
+                    base_url=base_low_url,
+                    endpoint_path=endpoint_path,
+                    kwargs={
+                        "lora_name": "low_noise_" + lora_name,
+                        "sd": sd,
+                    },
+                    headers=headers
+                )['data']['payload']
+        return (loras_list, )
+        # if not isinstance(strength, list):
+        #     strength = round(strength, 4)
+        #     if strength == 0.0:
+        #         if prev_lora is not None:
+        #             loras_list.extend(prev_lora)
+        #         return (loras_list,)
 
         try:
             lora_path = folder_paths.get_full_path("loras", lora)
@@ -535,12 +590,14 @@ class WanVideoLoraSelectMulti:
         base_high_url = None
         base_low_url = None
         if os.getenv("WAN_DIT_TYPE") == "wan22_s2v":
-            base_url = os.getenv("WAN22_S2V_URL", "http://localhost:8392")
+            base_url = os.getenv("WAN22_S2V_BASE_URL", "http://localhost:8392")
         elif os.getenv("WAN_DIT_TYPE") == "wan22_animate":
             base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
         elif os.getenv("WAN_DIT_TYPE") == "wan22_i2v":
             base_high_url = os.getenv("WAN22_HIGH_BASE_URL", "http://localhost:8192")
             base_low_url = os.getenv("WAN22_LOW_BASE_URL", "http://localhost:8193")
+        elif os.getenv("WAN_DIT_TYPE") == "wan22_infinitetalk":
+            base_url = os.getenv("WAN22_INFINITETALK_BASE_URL", "http://localhost:8334")
         else:
             raise ValueError(f'Wan DiT type {os.getenv("WAN_DIT_TYPE")} is not supported yet.')
         endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
@@ -564,7 +621,7 @@ class WanVideoLoraSelectMulti:
                     base_url=base_high_url,
                     endpoint_path=endpoint_path,
                     kwargs={
-                        "lora_name": lora_name,
+                        "lora_name": "high_noise_" + lora_name,
                         "sd": sd,
                     },
                     headers=headers
@@ -573,7 +630,7 @@ class WanVideoLoraSelectMulti:
                     base_url=base_low_url,
                     endpoint_path=endpoint_path,
                     kwargs={
-                        "lora_name": lora_name,
+                        "lora_name": "low_noise_" + lora_name,
                         "sd": sd,
                     },
                     headers=headers
@@ -1024,6 +1081,31 @@ def add_lora_weights(patcher, lora, base_dtype, merge_loras=False):
     unianimate_sd = None
     control_lora=False
     #spacepxl's control LoRA patch
+    import copy, math
+    model_copy = copy.deepcopy(patcher)
+    for l in lora:
+        lora_name, strength_model = l
+        if lora_name == "none" or strength_model == 0:
+            continue
+        if model_copy.model.pipeline.get("lora_name") is None:
+            model_copy.model["lora_name"] = []
+            model_copy.model["lora_name"].append(lora_name + "@" + str(strength_model))
+        else:
+            match_flag = False
+            for i, lora_id in enumerate(model_copy.model["lora_name"]):
+                if lora_id.startswith(lora_name):
+                    match_flag = True
+                    _, strength = lora_id.rsplit("@")
+                    strength = str(float(strength) + strength_model)
+                    if math.isclose(float(strength), 0.0):
+                        model_copy.model["lora_name"].pop(i)
+                    else:
+                        model_copy.model["lora_name"][i] = lora_name + "@" + str(strength)
+                    break
+            if match_flag == False:
+                model_copy.model["lora_name"].append(lora_name + "@" + str(strength_model))
+    return model_copy, control_lora, unianimate_sd
+
     for l in lora:
         log.info(f"Loading LoRA: {l['name']} with strength: {l['strength']}")
         lora_path = l["path"]
@@ -1112,8 +1194,10 @@ class WanVideoModelLoader:
             extra_model = vace_model
         lora_low_mem_load = merge_loras = False
         if lora is not None:
-            merge_loras = any(l.get("merge_loras", True) for l in lora)
-            lora_low_mem_load = any(l.get("low_mem_load", False) for l in lora)
+            # merge_loras = any(l.get("merge_loras", True) for l in lora)
+            merge_loras = False
+            # lora_low_mem_load = any(l.get("low_mem_load", False) for l in lora)
+            lora_low_mem_load = False
 
         transformer = None
         mm.unload_all_models()
@@ -1159,6 +1243,7 @@ class WanVideoModelLoader:
         gguf_reader = None
         if not gguf:
             sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
+            # sd = load_torch_file(model_path, device=torch.device("meta"), safe_load=True)
         else:
             gguf_reader=[]
             from .gguf.gguf import load_gguf

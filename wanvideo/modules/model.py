@@ -25,26 +25,26 @@ from ...echoshot.echoshot import rope_apply_z, rope_apply_c, rope_apply_echoshot
 from ...MTV.mtv import apply_rotary_emb
 
 from comfy import model_management as mm
-
+from diffusers.models.attention import AdaLayerNorm
 __all__ = ['WanModel']
 
-class AdaLayerNorm(nn.Module):
-    def __init__(self, embedding_dim, output_dim=None, norm_elementwise_affine=False, norm_eps=1e-5, dtype=None, device=None, operations=None):
-        super().__init__()
+# class AdaLayerNorm(nn.Module):
+#     def __init__(self, embedding_dim, output_dim=None, norm_elementwise_affine=False, norm_eps=1e-5, dtype=None, device=None, operations=None):
+#         super().__init__()
 
-        output_dim = output_dim or embedding_dim * 2
+#         output_dim = output_dim or embedding_dim * 2
 
-        self.silu = nn.SiLU()
-        self.linear = operations.Linear(embedding_dim, output_dim, dtype=dtype, device=device)
-        self.norm = operations.LayerNorm(output_dim // 2, norm_eps, norm_elementwise_affine, dtype=dtype, device=device)
+#         self.silu = nn.SiLU()
+#         self.linear = operations.Linear(embedding_dim, output_dim, dtype=dtype, device=device)
+#         self.norm = operations.LayerNorm(output_dim // 2, norm_eps, norm_elementwise_affine, dtype=dtype, device=device)
 
-    def forward(self, x, temb):
-        temb = self.linear(self.silu(temb))
-        shift, scale = temb.chunk(2, dim=1)
-        shift = shift[:, None, :]
-        scale = scale[:, None, :]
-        x = self.norm(x) * (1 + scale) + shift
-        return x
+#     def forward(self, x, temb):
+#         temb = self.linear(self.silu(temb))
+#         shift, scale = temb.chunk(2, dim=1)
+#         shift = shift[:, None, :]
+#         scale = scale[:, None, :]
+#         x = self.norm(x) * (1 + scale) + shift
+#         return x
 
 class FramePackMotioner(nn.Module):#from comfy.ldm.wan.model
     def __init__(
@@ -2312,7 +2312,7 @@ class WanModel(torch.nn.Module):
            freqs = freqs.to(device)
 
         _, F, H, W = x[0].shape
-            
+
         if y is not None:
             if hasattr(self, "randomref_embedding_pose") and unianim_data is not None:
                 if unianim_data['start_percent'] <= current_step_percentage <= unianim_data['end_percent']:

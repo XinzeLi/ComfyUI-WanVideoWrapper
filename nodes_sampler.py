@@ -5,6 +5,7 @@ from tqdm import tqdm
 import inspect
 from PIL import Image
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+import pickle
 
 from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
@@ -162,7 +163,6 @@ class WanVideoSampler:
         patcher = model
         model = model.model
         transformer = model.diffusion_model
-
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
         fp8_matmul = model["fp8_matmul"]
@@ -1679,8 +1679,6 @@ class WanVideoSampler:
                 #region main loop start
                 # start here!
                 base_url = None
-                base_high_url = None
-                base_low_url = None
                 from comfy.rpc_strategy import ParameterStrategyFactory
                 if os.getenv("WAN_DIT_TYPE") == "wan22_s2v":
                     base_url = os.getenv("WAN22_S2V_BASE_URL", "http://localhost:8392")
@@ -1689,15 +1687,24 @@ class WanVideoSampler:
                     base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
                     strategy = ParameterStrategyFactory.get_strategy("kj_wan_animate")
                 elif os.getenv("WAN_DIT_TYPE") == "wan22_i2v":
-                    base_high_url = os.getenv("WAN22_HIGH_BASE_URL", "http://localhost:8192")
-                    base_low_url = os.getenv("WAN22_LOW_BASE_URL", "http://localhost:8193")
+                    if "high" in os.path.basename(model.pipeline["base_path"]).lower() or start_step == 0:
+                        base_url = os.getenv("WAN22_HIGH_BASE_URL", "http://localhost:8192")
+                    elif "low" in os.path.basename(model.pipeline["base_path"]).lower() or end_step == -1 or end_step == steps:
+                        base_url = os.getenv("WAN22_LOW_BASE_URL", "http://localhost:8193")
+                    else:
+                        log.info(f"could not determine transformer type from safetensor name {os.path.basename(model.pipeline['base_path'])}, automatically dispatch to high noise transformer")
+                        base_url = os.getenv("WAN22_HIGH_BASE_URL", "http://localhost:8192")
+                    strategy = ParameterStrategyFactory.get_strategy("kj_wan_i2v")
+                elif os.getenv("WAN_DIT_TYPE") == "wan22_infinitetalk":
+                    base_url = os.getenv("WAN22_INFINITETALK_BASE_URL", "http://localhost:8334")
+                    strategy = ParameterStrategyFactory.get_strategy("kj_wan_infinitetalk")
                 else:
                     raise ValueError(f'Wan DiT type {os.getenv("WAN_DIT_TYPE")} is not supported yet.')
                 # create inputs for strategy method.
                 inputs = {
                     "model": model.pipeline,
                     "seed": seed,
-                    "steps": steps,
+                    "steps": total_steps,
                     "cfg": cfg,
                     "scheduler": scheduler,
                     "text_embeds": text_embeds,
@@ -1718,27 +1725,21 @@ class WanVideoSampler:
                     "s2v_pose": s2v_pose,
                     "s2v_ref_latent": s2v_ref_latent,
                 }
-                multi_turn = wananimate_loop or framepack
+                multi_turn = wananimate_loop or framepack or multitalk_sampling
                 if not multi_turn:
                     from comfybridge.bizyair import remote_call
                     faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
                     headers = {
                         "Authorization": f"Bearer {faas_token}"
                     }
-                    # if os.getenv("WAN_DIT_TYPE") == "wan22_s2v":
-                    #     strategy = ParameterStrategyFactory.get_strategy("kj_wan_s2v")
-                    # elif os.getenv("WAN_DIT_TYPE") == "wan22_animate":
-                    #     strategy = ParameterStrategyFactory.get_strategy("kj_wan_animate")
                     kwargs = strategy.get_parameters(inputs)
-                    # base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
                     endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
                     latent = remote_call(
-                            base_url=base_url,
-                            endpoint_path=endpoint_path,
-                            kwargs=kwargs,
-                            headers=headers
-                        )['data']['payload']
-
+                        base_url=base_url,
+                        endpoint_path=endpoint_path,
+                        kwargs=kwargs,
+                        headers=headers
+                    )['data']['payload']
                 for idx, t in enumerate(tqdm(timesteps, disable=multitalk_sampling or wananimate_loop)):
                     if not multi_turn:
                         break
@@ -2408,8 +2409,34 @@ class WanVideoSampler:
                             mm.soft_empty_cache()
                             gc.collect()
                             # sampling loop
+
+                            from comfybridge.bizyair import remote_call
+                            faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
+                            headers = {
+                                "Authorization": f"Bearer {faas_token}"
+                            }
+                            patch = {
+                                "latent": latent,
+                                "latent_motion_frames": latent_motion_frames,
+                                "image_cond": y,
+                                "multitalk_audio_embeds": audio_embs,
+                                "clip_embeds": clip_embeds,
+                            }
+                            inputs.update(patch)
+                            strategy = ParameterStrategyFactory.get_strategy("kj_wan_infinitetalk")
+                            kwargs = strategy.get_parameters(inputs)
+                            endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.infinitetalk.transformer")
+                            latent = remote_call(
+                                base_url=base_url,
+                                endpoint_path=endpoint_path,
+                                kwargs=kwargs,
+                                headers=headers
+                            )['data']['payload']
+                            latent = latent[0]["samples"].squeeze(0)
+
                             sampling_pbar = tqdm(total=len(timesteps)-1, desc=f"Sampling audio indices {audio_start_idx}-{audio_end_idx}", position=0, leave=True)
                             for i in range(len(timesteps)-1):
+                                break
                                 timestep = timesteps[i]
                                 latent_model_input = latent.to(device)
                                 if mode == "infinitetalk":
@@ -2666,7 +2693,6 @@ class WanVideoSampler:
                             inputs.update(patch)
                             strategy = ParameterStrategyFactory.get_strategy("kj_wan_s2v")
                             kwargs = strategy.get_parameters(inputs)
-                            # base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
                             endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
                             latent = remote_call(
                                 base_url=base_url,
@@ -2947,40 +2973,11 @@ class WanVideoSampler:
                             inputs.update(patch)
                             strategy = ParameterStrategyFactory.get_strategy("kj_wan_animate")
                             kwargs = strategy.get_parameters(inputs)
-                            # base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
                             endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
                             latent = remote_call(
                                 base_url=base_url,
                                 endpoint_path=endpoint_path,
                                 kwargs=kwargs,
-                                # kwargs={
-                                #     'model': model.pipeline,
-                                #     'seed': seed,
-                                #     'steps': steps,
-                                #     'cfg': cfg,
-                                #     'sampler_name': None,
-                                #     'scheduler': scheduler,
-                                #     'positive_prompt_embeds': text_embeds["prompt_embeds"][0].unsqueeze(0).contiguous(),
-                                #     'negative_prompt_embeds': text_embeds["negative_prompt_embeds"][0].unsqueeze(0).contiguous(),
-                                #     'penultimate_hidden_states': clip_fea.contiguous(),
-                                #     # "pose_video_latent": wananim_pose_latents.contiguous(),
-                                #     "pose_video_latent": pose_input_slice.contiguous(),
-                                #     "pose_strength": wananim_pose_strength,
-                                #     # "face_video_pixels": wananim_face_pixels.contiguous(),
-                                #     "face_video_pixels": face_images_in.contiguous(),
-                                #     "face_strength": wananim_face_strength,
-                                #     "concat_latent_image": image_cond_in[4:].unsqueeze(0).contiguous(),
-                                #     'concat_mask': (1.0 - image_cond_in[:4]).unsqueeze(0).contiguous(),
-                                #     'latent': {"samples": latent.unsqueeze(0).contiguous()},
-                                #     'denoise': None,
-                                #     'disable_noise': True,
-                                #     'start_step': start_step,
-                                #     'last_step': end_step,
-                                #     'force_full_denoise': add_noise_to_samples,
-                                #     "enable_preprocess": False,
-                                #     "enable_postprocess": False,
-                                #     "shift": shift,
-                                # },
                                 headers=headers
                             )['data']['payload']
                             latent = latent[0]["samples"].squeeze(0)
