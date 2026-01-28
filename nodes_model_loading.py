@@ -7,6 +7,8 @@ from tqdm import tqdm
 import re
 import safetensors
 import safetensors.torch
+import json
+import mmap
 
 from .wanvideo.modules.model import WanModel, LoRALinearLayer
 from .wanvideo.modules.t5 import T5EncoderModel
@@ -37,6 +39,30 @@ try:
     from server import PromptServer
 except:
     PromptServer = None
+
+# lixinze: adapt from https://gist.github.com/Narsil/3edeec2669a5e94e4707aa0f901d2282
+def custom_load_file(filename, device="meta"):
+    with open(filename, mode="r", encoding="utf8") as file_obj:
+        with mmap.mmap(file_obj.fileno(), length=0, access=mmap.ACCESS_READ) as m:
+            header = m.read(8)
+            n = int.from_bytes(header, "little")
+            metadata_bytes = m.read(n)
+            metadata = json.loads(metadata_bytes)
+
+    size = os.stat(filename).st_size
+    storage = torch.ByteStorage.from_file(filename, shared=False, size=size).untyped()
+    offset = n + 8
+    return {name: create_tensor(storage, info, offset, device) for name, info in metadata.items() if name != "__metadata__"}
+
+
+DTYPES_MAP = {"F32": torch.float32, "BF16": torch.bfloat16, "F16": torch.float16, "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2}
+
+
+def create_tensor(storage, info, offset, device="meta"):
+    dtype = DTYPES_MAP[info["dtype"]]
+    shape = info["shape"]
+    start, stop = info["data_offsets"]
+    return torch.asarray(storage[start + offset : stop + offset], device=device, dtype=torch.uint8).view(dtype=dtype).reshape(shape)
 
 #from city96's gguf nodes
 def update_folder_names_and_paths(key, targets=[]):
@@ -1236,13 +1262,14 @@ class WanVideoModelLoader:
                     torch.backends.cuda.matmul.allow_fp16_accumulation = False
             except:
                 pass
- 
+
 
         model_path = folder_paths.get_full_path_or_raise("diffusion_models", model)
 
         gguf_reader = None
         if not gguf:
-            sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
+            sd = custom_load_file(model_path, device="meta")
+            # sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
             # sd = load_torch_file(model_path, device=torch.device("meta"), safe_load=True)
         else:
             gguf_reader=[]
@@ -1930,7 +1957,10 @@ class LoadWanVideoT5TextEncoder:
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
         model_path = folder_paths.get_full_path("text_encoders", model_name)
-        sd = load_torch_file(model_path, safe_load=True)
+        if load_device == "offload_device":
+            sd = load_torch_file(model_path, safe_load=True)
+        elif load_device == "main_device":
+            sd = load_torch_file(model_path, safe_load=True, device="cuda")
 
         if quantization == "disabled":
             for k, v in sd.items():

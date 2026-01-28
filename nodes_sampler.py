@@ -1733,6 +1733,10 @@ class WanVideoSampler:
                         "Authorization": f"Bearer {faas_token}"
                     }
                     kwargs = strategy.get_parameters(inputs)
+                    save_healthcheck_file = bool(int(os.getenv("SAVE_HEALTHCHECK", "0")))
+                    dit_type = os.getenv("WAN_DIT_TYPE")
+                    if save_healthcheck_file:
+                        torch.save(kwargs, f"{dit_type}_health_check.pt")
                     endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
                     latent = remote_call(
                         base_url=base_url,
@@ -2693,6 +2697,9 @@ class WanVideoSampler:
                             inputs.update(patch)
                             strategy = ParameterStrategyFactory.get_strategy("kj_wan_s2v")
                             kwargs = strategy.get_parameters(inputs)
+                            save_healthcheck_file = bool(int(os.getenv("SAVE_HEALTHCHECK", "0")))
+                            if save_healthcheck_file:
+                                torch.save(kwargs, "s2v_health_check.pt")
                             endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
                             latent = remote_call(
                                 base_url=base_url,
@@ -2973,6 +2980,9 @@ class WanVideoSampler:
                             inputs.update(patch)
                             strategy = ParameterStrategyFactory.get_strategy("kj_wan_animate")
                             kwargs = strategy.get_parameters(inputs)
+                            save_healthcheck_file = bool(int(os.getenv("SAVE_HEALTHCHECK", "0")))
+                            if save_healthcheck_file:
+                                torch.save(kwargs, "animate_health_check.pt")
                             endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
                             latent = remote_call(
                                 base_url=base_url,
