@@ -28,7 +28,7 @@ from ...MTV.mtv import apply_rotary_emb
 from comfy.ldm.flux.math import apply_rope1 as apply_rope_comfy1
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
 from comfy import model_management as mm
-from diffusers.models.attention import AdaLayerNorm
+
 __all__ = ['WanModel']
 
 def apply_rotary_emb_split(hidden_states, freqs_cis, t_dim):
@@ -47,19 +47,19 @@ class AdaLayerNorm(nn.Module):
     def __init__(self, embedding_dim, output_dim=None, norm_elementwise_affine=False, norm_eps=1e-5):
         super().__init__()
 
-#         output_dim = output_dim or embedding_dim * 2
+        output_dim = output_dim or embedding_dim * 2
 
         self.silu = nn.SiLU()
         self.linear = nn.Linear(embedding_dim, output_dim)
         self.norm = nn.LayerNorm(output_dim // 2, norm_eps, norm_elementwise_affine)
 
-#     def forward(self, x, temb):
-#         temb = self.linear(self.silu(temb))
-#         shift, scale = temb.chunk(2, dim=1)
-#         shift = shift[:, None, :]
-#         scale = scale[:, None, :]
-#         x = self.norm(x) * (1 + scale) + shift
-#         return x
+    def forward(self, x, temb):
+        temb = self.linear(self.silu(temb))
+        shift, scale = temb.chunk(2, dim=1)
+        shift = shift[:, None, :]
+        scale = scale[:, None, :]
+        x = self.norm(x) * (1 + scale) + shift
+        return x
 
 class FramePackMotioner(nn.Module):#from comfy.ldm.wan.model
     def __init__(

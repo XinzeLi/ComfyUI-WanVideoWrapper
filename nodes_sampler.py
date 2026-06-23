@@ -31,6 +31,38 @@ rope_functions = ["default", "comfy", "comfy_chunked"]
 VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
 
+# Default service endpoints
+DEFAULT_WAN_DIT_BASE_URL = "http://localhost:8195"
+DEFAULT_WAN_DIT_ENDPOINT = "/rpc/wan-dit-server"
+from comfybridge.bizyair import remote_call
+
+def remote_wan_crossing(
+    **kwargs,
+):
+    _dummy = torch.randn(1024 * 256).cuda()
+    comfy_token = os.getenv("COMFY_TOKEN")
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if comfy_token:
+        headers["Authorization"] = f"Bearer {comfy_token}"
+
+    try:
+        result = remote_call(
+            headers=headers,
+            base_url=os.getenv("WAN_DIT_BASE_URL", DEFAULT_WAN_DIT_BASE_URL),
+            endpoint_path=os.getenv("WAN_DIT_ENDPOINT_PATH", DEFAULT_WAN_DIT_ENDPOINT),
+            kwargs=kwargs,
+        )
+
+        if result is None or "data" not in result or "payload" not in result["data"]:
+            raise ValueError(f"Invalid response format from remote ksampler: {result}")
+
+        out = result["data"]["payload"]
+    finally:
+        del _dummy
+    return out
+
 
 class WanVideoSampler:
     @classmethod
@@ -86,6 +118,7 @@ class WanVideoSampler:
         patcher = model
         model = model.model
         transformer = model.diffusion_model
+
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
         fp8_matmul = model["fp8_matmul"]
@@ -117,25 +150,25 @@ class WanVideoSampler:
                 if hasattr(block, 'audio_block'):
                     block.audio_block = None
 
-        if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and gguf_reader is None:
-            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], compile_args=model["compile_args"])
-            transformer.patched_linear = True
-        if patcher.model["sd"] is not None and gguf_reader is None:
-            load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device,
-                         block_swap_args=block_swap_args, compile_args=model["compile_args"])
+        # if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and gguf_reader is None:
+        #     transformer = _replace_linear(transformer, dtype, patcher.model["sd"], compile_args=model["compile_args"])
+        #     transformer.patched_linear = True
+        # if patcher.model["sd"] is not None and gguf_reader is None:
+        #     load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device,
+        #                  block_swap_args=block_swap_args, compile_args=model["compile_args"])
 
-        if gguf_reader is not None: #handle GGUF
-            load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True,
-                         reader=gguf_reader, block_swap_args=block_swap_args, compile_args=model["compile_args"])
-            set_lora_params_gguf(transformer, patcher.patches)
-            transformer.patched_linear = True
-        elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
-            log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
-            if not merge_loras and fp8_matmul:
-                raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
-            set_lora_params(transformer, patcher.patches)
-        else:
-            remove_lora_from_module(transformer) #clear possible unmerged lora weights
+        # if gguf_reader is not None: #handle GGUF
+        #     load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True,
+        #                  reader=gguf_reader, block_swap_args=block_swap_args, compile_args=model["compile_args"])
+        #     set_lora_params_gguf(transformer, patcher.patches)
+        #     transformer.patched_linear = True
+        # elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
+        #     log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
+        #     if not merge_loras and fp8_matmul:
+        #         raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
+        #     set_lora_params(transformer, patcher.patches)
+        # else:
+        #     remove_lora_from_module(transformer) #clear possible unmerged lora weights
 
         # transformer.lora_scheduling_enabled = transformer_options.get("lora_scheduling_enabled", False)
 
@@ -1797,9 +1830,44 @@ class WanVideoSampler:
                     pusa_noisy_steps = len(timesteps)
             try:
                 pbar = ProgressBar(len(timesteps) - ttm_start_step)
+                remote_model = model.pipeline
+                remote_model["sd"] = {}
+                remote_kwargs = {
+                    "model": remote_model,
+                    "seed": seed,
+                    "steps": total_steps,
+                    "cfg": cfg,
+                    "scheduler": scheduler,
+                    "text_embeds": text_embeds,
+                    "clip_fea": clip_fea,
+                    "wananim_pose_latents": wananim_pose_latents,
+                    "wananim_pose_strength": wananim_pose_strength,
+                    "wananim_face_pixels": wananim_face_pixels,
+                    "wananim_face_strength": wananim_face_strength,
+                    "image_cond": image_cond,
+                    "latent": latent,
+                    "start_step": start_step,
+                    "end_step": end_step,
+                    "add_noise_to_samples": add_noise_to_samples,
+                    "shift": shift,
+                    "s2v_audio_input": s2v_audio_input,
+                    "s2v_audio_scale": s2v_audio_scale if s2v_audio_input is not None else 1.0,
+                    "s2v_ref_motion": s2v_ref_motion,
+                    "s2v_pose": s2v_pose,
+                    "s2v_ref_latent": s2v_ref_latent,
+                    "lora_dict": (
+                        patcher.attachments["_lora_dict"]
+                        if "_lora_dict" in patcher.attachments
+                        else None
+                    ),
+                }
+                multi_turn = wananimate_loop or framepack or multitalk_sampling
+                if not multi_turn:
+                    latent = remote_wan_crossing(**remote_kwargs)
                 #region main loop start
                 for idx, t in enumerate(tqdm(timesteps[ttm_start_step:], disable=multitalk_sampling or wananimate_loop)):
-
+                    if not multi_turn:
+                        break
                     if bidirectional_sampling:
                         latent_flipped = torch.flip(latent, dims=[1])
                         latent_model_input_flipped = latent_flipped.to(device)
@@ -2136,36 +2204,7 @@ class WanVideoSampler:
                                 sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, denoise_strength, sigmas=sigmas)
 
                             latent = noise.to(device)
-                            # start here!
-                            from comfybridge.bizyair import remote_call
-                            faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
-                            headers = {
-                                "Authorization": f"Bearer {faas_token}"
-                            }
-                            patch = {
-                                "latent": latent,
-                                "s2v_audio_input": s2v_audio_input_slice,
-                                "s2v_ref_motion": input_motion_latents,
-                                "s2v_pose": s2v_pose_slice,
-                                "s2v_ref_latent": s2v_ref_latent,
-                                "s2v_motion_frames": s2v_motion_frames,
-                            }
-                            inputs.update(patch)
-                            strategy = ParameterStrategyFactory.get_strategy("kj_wan_s2v")
-                            kwargs = strategy.get_parameters(inputs)
-                            save_healthcheck_file = bool(int(os.getenv("SAVE_HEALTHCHECK", "0")))
-                            if save_healthcheck_file:
-                                torch.save(kwargs, "s2v_health_check.pt")
-                            endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
-                            latent = remote_call(
-                                base_url=base_url,
-                                endpoint_path=endpoint_path,
-                                kwargs=kwargs,
-                                headers=headers
-                            )['data']['payload']
-                            latent = latent[0]["samples"].squeeze(0)
                             for i, t in enumerate(tqdm(timesteps, desc=f"Sampling audio indices {left_idx}-{right_idx}", position=0)):
-                                break
                                 latent_model_input = latent.to(device)
                                 timestep = torch.tensor([t]).to(device)
                                 noise_pred, _, self.cache_state = predict_with_cfg(
@@ -2189,8 +2228,7 @@ class WanVideoSampler:
 
 
                             vae.to(device)
-                            print(f"ref motion shape is {ref_motion.unsqueeze(0).shape}, latent shape is {latent.unsqueeze(0).shape}")
-                            decode_latents = torch.cat([ref_motion.unsqueeze(0).to(device), latent.unsqueeze(0).to(device)], dim=2)
+                            decode_latents = torch.cat([ref_motion.unsqueeze(0), latent.unsqueeze(0)], dim=2)
                             image = vae.decode(decode_latents.to(device, vae.dtype), device=device, pbar=False)[0]
                             del decode_latents
                             image = image.unsqueeze(0)[:, :, -infer_frames:]
@@ -2298,7 +2336,7 @@ class WanVideoSampler:
 
                             if current_ref_images is not None or bg_images is not None or ref_latent is not None:
                                 if offload:
-                                    offload_transformer(transformer, remove_lora=False)
+                                    # offload_transformer(transformer, remove_lora=False)
                                     offloaded = True
                                 vae.to(device)
                                 if wananim_ref_masks is not None:
@@ -2429,33 +2467,7 @@ class WanVideoSampler:
                             gc.collect()
                             # inner WanAnimate sampling loop
                             sampling_pbar = tqdm(total=len(timesteps), desc=f"Frames {start}-{end}", position=0, leave=True)
-                            from comfybridge.bizyair import remote_call
-                            faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
-                            headers = {
-                                "Authorization": f"Bearer {faas_token}"
-                            }
-                            patch = {
-                                "latent": latent,
-                                "wananim_pose_latents": pose_input_slice,
-                                "wananim_face_pixels": face_images_in,
-                                "image_cond": image_cond_in,
-                            }
-                            inputs.update(patch)
-                            strategy = ParameterStrategyFactory.get_strategy("kj_wan_animate")
-                            kwargs = strategy.get_parameters(inputs)
-                            save_healthcheck_file = bool(int(os.getenv("SAVE_HEALTHCHECK", "0")))
-                            if save_healthcheck_file:
-                                torch.save(kwargs, "animate_health_check.pt")
-                            endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
-                            latent = remote_call(
-                                base_url=base_url,
-                                endpoint_path=endpoint_path,
-                                kwargs=kwargs,
-                                headers=headers
-                            )['data']['payload']
-                            latent = latent[0]["samples"].squeeze(0)
                             for i in range(len(timesteps)):
-                                break
                                 timestep = timesteps[i]
                                 latent_model_input = latent.to(device)
 
@@ -2487,7 +2499,7 @@ class WanVideoSampler:
 
                             del noise
                             if offload:
-                                offload_transformer(transformer, remove_lora=False)
+                                # offload_transformer(transformer, remove_lora=False)
                                 offloaded = True
 
                             vae.to(device)
@@ -2541,8 +2553,9 @@ class WanVideoSampler:
 
                         if force_offload:
                             vae.to(offload_device)
-                            # if not model["auto_cpu_offload"]:
-                            #     offload_transformer(transformer)
+                            if not model["auto_cpu_offload"]:
+                                # offload_transformer(transformer)
+                                pass
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
@@ -2659,7 +2672,8 @@ class WanVideoSampler:
                 raise
             finally:
                 if force_offload and not model["auto_cpu_offload"]:
-                    offload_transformer(transformer)
+                    # offload_transformer(transformer)
+                    pass
 
         if phantom_latents is not None:
             latent = latent[:,:-phantom_latents.shape[1]]
@@ -2689,18 +2703,21 @@ class WanVideoSampler:
         except Exception:
             pass
         return ({
-            "samples": latent.unsqueeze(0).cpu(),
+            # "samples": latent.unsqueeze(0).cpu(),
+            "samples": latent.cpu(),
             "looped": is_looped,
             "end_image": end_image if not fun_or_fl2v_model else None,
             "has_ref": has_ref,
             "drop_last": drop_last,
             "generator_state": seed_g.get_state(),
-            "original_image": original_image.cpu() if original_image is not None else None,
+            # "original_image": original_image.cpu() if original_image is not None else None,
+            "original_image": None,
             "cache_states": cache_states,
             "latent_ovi_audio": latent_ovi.unsqueeze(0).transpose(1, 2).cpu() if latent_ovi is not None else None,
             "flashvsr_LQ_images": LQ_images,
         },{
-            "samples": callback_latent.unsqueeze(0).cpu() if callback is not None else None,
+            # "samples": callback_latent.unsqueeze(0).cpu() if callback is not None else None,
+            "samples": None,
         })
 
 class WanVideoSamplerSettings(WanVideoSampler):

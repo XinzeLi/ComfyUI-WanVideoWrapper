@@ -5,10 +5,6 @@ from .utils import log, apply_lora
 import numpy as np
 from tqdm import tqdm
 import re
-import safetensors
-import safetensors.torch
-import json
-import mmap
 
 from .wanvideo.modules.model import WanModel, LoRALinearLayer, WanRMSNorm
 from .wanvideo.modules.t5 import T5EncoderModel
@@ -29,6 +25,12 @@ try:
     from gguf import GGMLQuantizationType
 except Exception:
     pass
+import loguru
+import safetensors
+import safetensors.torch
+import json
+import mmap
+import validators
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -42,6 +44,32 @@ except Exception:
 
 attention_modes = ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3", "radial_sage_attention", "sageattn_compiled",
                     "sageattn_ultravico", "comfy"]
+
+
+# lixinze: adapt from https://gist.github.com/Narsil/3edeec2669a5e94e4707aa0f901d2282
+def custom_load_file(filename, device="meta"):
+    with open(filename, mode="r", encoding="utf8") as file_obj:
+        with mmap.mmap(file_obj.fileno(), length=0, access=mmap.ACCESS_READ) as m:
+            header = m.read(8)
+            n = int.from_bytes(header, "little")
+            metadata_bytes = m.read(n)
+            metadata = json.loads(metadata_bytes)
+
+    size = os.stat(filename).st_size
+    storage = torch.ByteStorage.from_file(filename, shared=False, size=size).untyped()
+    offset = n + 8
+    return {name: create_tensor(storage, info, offset, device) for name, info in metadata.items() if name != "__metadata__"}
+
+
+DTYPES_MAP = {"F32": torch.float32, "BF16": torch.bfloat16, "F16": torch.float16, "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2}
+
+
+def create_tensor(storage, info, offset, device="meta"):
+    dtype = DTYPES_MAP[info["dtype"]]
+    shape = info["shape"]
+    start, stop = info["data_offsets"]
+    return torch.asarray(storage[start + offset : stop + offset], device=device, dtype=torch.uint8).view(dtype=dtype).reshape(shape)
+
 
 #from city96's gguf nodes
 def update_folder_names_and_paths(key, targets=[]):
@@ -383,8 +411,9 @@ class WanVideoLoraSelect:
     def INPUT_TYPES(s):
         return {
             "required": {
-               "lora": (folder_paths.get_filename_list("loras"),
-                {"tooltip": "LORA models are expected to be in ComfyUI/models/loras with .safetensors extension"}),
+                "lora": ("STRING", {"default": "", "multiline": False} ),
+            #    "lora": (folder_paths.get_filename_list("loras"),
+            #     {"tooltip": "LORA models are expected to be in ComfyUI/models/loras with .safetensors extension"}),
                 "strength": ("FLOAT", {"default": 1.0, "min": -1000.0, "max": 1000.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
             },
             "optional": {
@@ -407,69 +436,31 @@ class WanVideoLoraSelect:
     def getlorapath(self, lora, strength, unique_id, blocks={}, prev_lora=None, low_mem_load=False, merge_loras=True):
         if not merge_loras:
             low_mem_load = False  # Unmerged LoRAs don't need low_mem_load
-        # loras_list = []
-        loras_list = [(lora, strength)]
-        from comfybridge.bizyair import remote_call
-        import math
-        faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
-        headers = {
-            "Authorization": f"Bearer {faas_token}"
+        loras_list = []
+
+        if not isinstance(strength, list):
+            strength = round(strength, 4)
+            if strength == 0.0:
+                if prev_lora is not None:
+                    loras_list.extend(prev_lora)
+                return (loras_list,)
+
+        if validators.url(lora):
+            log.info(f"Sending lora url {lora}")
+            lora_entry = {
+                "path": lora,
+                "strength": strength,
+                "name": lora,
+                "blocks": blocks.get("selected_blocks", {}),
+                "layer_filter": blocks.get("layer_filter", ""),
+                "low_mem_load": low_mem_load,
+                "merge_loras": merge_loras,
             }
-        base_url = None
-        base_high_url = None
-        base_low_url = None
-        if os.getenv("WAN_DIT_TYPE") == "wan22_s2v":
-            base_url = os.getenv("WAN22_S2V_BASE_URL", "http://localhost:8392")
-        elif os.getenv("WAN_DIT_TYPE") == "wan22_animate":
-            base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
-        elif os.getenv("WAN_DIT_TYPE") == "wan22_i2v":
-            base_high_url = os.getenv("WAN22_HIGH_BASE_URL", "http://localhost:8192")
-            base_low_url = os.getenv("WAN22_LOW_BASE_URL", "http://localhost:8193")
-        elif os.getenv("WAN_DIT_TYPE") == "wan22_infinitetalk":
-            base_url = os.getenv("WAN22_INFINITETALK_BASE_URL", "http://localhost:8334")
-        else:
-            raise ValueError(f'Wan DiT type {os.getenv("WAN_DIT_TYPE")} is not supported yet.')
-        endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
-        lora_name = lora
-        if lora_name != "none":
-            lora_path = folder_paths.get_full_path("loras", lora_name)
-            sd = safetensors.torch.load_file(lora_path)
-            if base_url is not None:
-                remote_call(
-                    base_url=base_url,
-                    endpoint_path=endpoint_path,
-                    kwargs={
-                        "lora_name": lora_name,
-                        "sd": sd,
-                    },
-                    headers=headers
-                )['data']['payload']
-            elif base_high_url is not None and base_low_url is not None:
-                remote_call(
-                    base_url=base_high_url,
-                    endpoint_path=endpoint_path,
-                    kwargs={
-                        "lora_name": "high_noise_" + lora_name,
-                        "sd": sd,
-                    },
-                    headers=headers
-                )['data']['payload']
-                remote_call(
-                    base_url=base_low_url,
-                    endpoint_path=endpoint_path,
-                    kwargs={
-                        "lora_name": "low_noise_" + lora_name,
-                        "sd": sd,
-                    },
-                    headers=headers
-                )['data']['payload']
-        return (loras_list, )
-        # if not isinstance(strength, list):
-        #     strength = round(strength, 4)
-        #     if strength == 0.0:
-        #         if prev_lora is not None:
-        #             loras_list.extend(prev_lora)
-        #         return (loras_list,)
+            if prev_lora is not None:
+                loras_list.extend(prev_lora)
+
+            loras_list.append(lora_entry)
+            return (loras_list,)
 
         try:
             lora_path = folder_paths.get_full_path_or_raise("loras", lora)
@@ -565,15 +556,15 @@ class WanVideoLoraSelectMulti:
         lora_files = ["none"] + lora_files  # Add "none" as the first option
         return {
             "required": {
-               "lora_0": (lora_files, {"default": "none"}),
+                "lora_0": ("STRING", {"default": "none"}),
                 "strength_0": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
-                "lora_1": (lora_files, {"default": "none"}),
+                "lora_1": ("STRING", {"default": "none"}),
                 "strength_1": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
-                "lora_2": (lora_files, {"default": "none"}),
+                "lora_2": ("STRING", {"default": "none"}),
                 "strength_2": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
-                "lora_3": (lora_files, {"default": "none"}),
+                "lora_3": ("STRING", {"default": "none"}),
                 "strength_3": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
-                "lora_4": (lora_files, {"default": "none"}),
+                "lora_4": ("STRING", {"default": "none"}),
                 "strength_4": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
             },
             "optional": {
@@ -604,64 +595,21 @@ class WanVideoLoraSelectMulti:
             (lora_3, strength_3),
             (lora_4, strength_4)
         ]
-        from comfybridge.bizyair import remote_call
-        faas_token = os.getenv("FAAS_TOKEN", "sk-llbmspexeycidkzadzwbqmzwqiuznytimogfifjicrviacyy")
-        headers = {
-            "Authorization": f"Bearer {faas_token}"
-            }
-        base_url = None
-        base_high_url = None
-        base_low_url = None
-        if os.getenv("WAN_DIT_TYPE") == "wan22_s2v":
-            base_url = os.getenv("WAN22_S2V_BASE_URL", "http://localhost:8392")
-        elif os.getenv("WAN_DIT_TYPE") == "wan22_animate":
-            base_url = os.getenv("WAN22_ANIMATE_BASE_URL", "http://localhost:8467")
-        elif os.getenv("WAN_DIT_TYPE") == "wan22_i2v":
-            base_high_url = os.getenv("WAN22_HIGH_BASE_URL", "http://localhost:8192")
-            base_low_url = os.getenv("WAN22_LOW_BASE_URL", "http://localhost:8193")
-        elif os.getenv("WAN_DIT_TYPE") == "wan22_infinitetalk":
-            base_url = os.getenv("WAN22_INFINITETALK_BASE_URL", "http://localhost:8334")
-        else:
-            raise ValueError(f'Wan DiT type {os.getenv("WAN_DIT_TYPE")} is not supported yet.')
-        endpoint_path = os.getenv("WAN22_ENDPOINT_PATH", "/rpc/wan22.animate.transformer")
-        for lora_name, strength in lora_inputs:
-            if lora_name == "none":
-                continue
-            lora_path = folder_paths.get_full_path("loras", lora_name)
-            sd = safetensors.torch.load_file(lora_path)
-            if base_url is not None:
-                remote_call(
-                    base_url=base_url,
-                    endpoint_path=endpoint_path,
-                    kwargs={
-                        "lora_name": lora_name,
-                        "sd": sd,
-                    },
-                    headers=headers
-                )['data']['payload']
-            elif base_high_url is not None and base_low_url is not None:
-                remote_call(
-                    base_url=base_high_url,
-                    endpoint_path=endpoint_path,
-                    kwargs={
-                        "lora_name": "high_noise_" + lora_name,
-                        "sd": sd,
-                    },
-                    headers=headers
-                )['data']['payload']
-                remote_call(
-                    base_url=base_low_url,
-                    endpoint_path=endpoint_path,
-                    kwargs={
-                        "lora_name": "low_noise_" + lora_name,
-                        "sd": sd,
-                    },
-                    headers=headers
-                )['data']['payload']
-        return (lora_inputs, )
         for lora_name, strength in lora_inputs:
             s = round(strength, 4) if not isinstance(strength, list) else strength
             if not lora_name or lora_name == "none" or s == 0.0:
+                continue
+            if validators.url(lora_name):
+                log.info(f"Sending lora url {lora_name}")
+                loras_list.append({
+                    "path": lora_name,
+                    "strength": s,
+                    "name": lora_name,
+                    "blocks": blocks.get("selected_blocks", {}),
+                    "layer_filter": blocks.get("layer_filter", ""),
+                    "low_mem_load": low_mem_load,
+                    "merge_loras": merge_loras,
+                })
                 continue
             loras_list.append({
                 "path": folder_paths.get_full_path_or_raise("loras", lora_name),
@@ -841,6 +789,9 @@ def load_lora_for_models_mod(model, lora, strength_model):
     return (new_modelpatcher)
 
 class WanVideoSetLoRAs:
+    def __init__(self):
+        self.instance_id = str(uuid.uuid4())
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -863,6 +814,42 @@ class WanVideoSetLoRAs:
     def setlora(self, model, lora=None):
         if lora is None:
             return (model,)
+
+        # 1. 按 (path, name) 聚合，strength 累加，其他字段保留首次出现的值
+        _merged = {}
+        for _item in lora:
+            _key = (_item["path"], _item["name"])
+            if _key not in _merged:
+                _merged[_key] = _item.copy()   # copy 避免修改原始 dict
+            else:
+                _merged[_key]["strength"] += _item["strength"]
+        # 2. 过滤 strength 为 0 的项，并写回 lora
+        lora = [_v for _v in _merged.values() if _v["strength"] != 0]
+        if len(lora) == 0:
+            return (model,)
+        model_lora = model.clone()
+
+        def deep_copy_attribute(object, attr_name: str, default_val):
+            if attr_name in object:
+                object[attr_name] = object[attr_name].copy()
+            else:
+                object[attr_name] = default_val
+        deep_copy_attribute(model_lora.attachments, "_lora_dict", {})
+
+        loaded_lora_list = []
+        for l in lora:
+            lora_name, lora_path, strength_model = l["name"], l["path"], l["strength"]
+            if validators.url(lora_name):
+                lora_weight = lora_name
+            else:
+                lora_weight = load_torch_file(lora_path, safe_load=True)
+            loaded_lora = (lora_name, lora_weight, strength_model, 0)
+            loaded_lora_list.append(loaded_lora)
+            loguru.logger.info(
+                f"Applied lora {lora_name} with strength {strength_model} to model (instance {self.instance_id})"
+            )
+        model_lora.attachments["_lora_dict"][self.instance_id] = loaded_lora_list
+        return (model_lora,)
 
         patcher = model.clone()
 
@@ -1088,31 +1075,6 @@ def add_lora_weights(patcher, lora, base_dtype, merge_loras=False):
     unianimate_sd = None
     control_lora=False
     #spacepxl's control LoRA patch
-    import copy, math
-    model_copy = copy.deepcopy(patcher)
-    for l in lora:
-        lora_name, strength_model = l
-        if lora_name == "none" or strength_model == 0:
-            continue
-        if model_copy.model.pipeline.get("lora_name") is None:
-            model_copy.model["lora_name"] = []
-            model_copy.model["lora_name"].append(lora_name + "@" + str(strength_model))
-        else:
-            match_flag = False
-            for i, lora_id in enumerate(model_copy.model["lora_name"]):
-                if lora_id.startswith(lora_name):
-                    match_flag = True
-                    _, strength = lora_id.rsplit("@")
-                    strength = str(float(strength) + strength_model)
-                    if math.isclose(float(strength), 0.0):
-                        model_copy.model["lora_name"].pop(i)
-                    else:
-                        model_copy.model["lora_name"][i] = lora_name + "@" + str(strength)
-                    break
-            if match_flag == False:
-                model_copy.model["lora_name"].append(lora_name + "@" + str(strength_model))
-    return model_copy, control_lora, unianimate_sd
-
     for l in lora:
         log.info(f"Loading LoRA: {l['name']} with strength: {l['strength']}")
         lora_path = l["path"]
@@ -1214,6 +1176,9 @@ class WanVideoUltraVicoSettings:
 
 #region Model loading
 class WanVideoModelLoader:
+    def __init__(self):
+        self.instance_id = str(uuid.uuid4())
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -1248,16 +1213,12 @@ class WanVideoModelLoader:
                   compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, extra_model=None, vace_model=None,
                   fantasytalking_model=None, multitalk_model=None, fantasyportrait_model=None, rms_norm_function="default"):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
-        # lixinze: hard coding load device.
-        load_device = "offload_device"
         if vace_model is not None:
             extra_model = vace_model
         lora_low_mem_load = merge_loras = False
         if lora is not None:
-            # merge_loras = any(l.get("merge_loras", True) for l in lora)
-            merge_loras = False
-            # lora_low_mem_load = any(l.get("low_mem_load", False) for l in lora)
-            lora_low_mem_load = False
+            merge_loras = any(l.get("merge_loras", True) for l in lora)
+            lora_low_mem_load = any(l.get("low_mem_load", False) for l in lora)
 
         transformer = None
         mm.unload_all_models()
@@ -1304,7 +1265,6 @@ class WanVideoModelLoader:
         if not gguf:
             sd = custom_load_file(model_path, device="meta")
             # sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
-            # sd = load_torch_file(model_path, device=torch.device("meta"), safe_load=True)
         else:
             gguf_reader=[]
             from .gguf.gguf import load_gguf
@@ -1854,10 +1814,10 @@ class WanVideoModelLoader:
         patcher.model.is_patched = False
 
         scale_weights = {}
-        if "fp8" in quantization:
-            for k, v in sd.items():
-                if k.endswith(".scale_weight"):
-                    scale_weights[k] = v.to(device, base_dtype)
+        # if "fp8" in quantization:
+        #     for k, v in sd.items():
+        #         if k.endswith(".scale_weight"):
+        #             scale_weights[k] = v.to(device, base_dtype)
 
         if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast"]:
             weight_dtype = torch.float8_e4m3fn
@@ -1872,41 +1832,77 @@ class WanVideoModelLoader:
 
         if not merge_loras and control_lora:
             log.warning("Control-LoRA patching is only supported with merge_loras=True")
-
         if lora is not None:
-            patcher, control_lora, unianimate_sd = add_lora_weights(patcher, lora, base_dtype, merge_loras=merge_loras)
-            if unianimate_sd is not None:
-                log.info("Merging UniAnimate weights to the model...")
-                sd.update(unianimate_sd)
-                del unianimate_sd
+            # 1. 按 (path, name) 聚合，strength 累加，其他字段保留首次出现的值
+            _merged = {}
+            for _item in lora:
+                _key = (_item["path"], _item["name"])
+                if _key not in _merged:
+                    _merged[_key] = _item.copy()   # copy 避免修改原始 dict
+                else:
+                    _merged[_key]["strength"] += _item["strength"]
+            # 2. 过滤 strength 为 0 的项，并写回 lora
+            lora_list = [_v for _v in _merged.values() if _v["strength"] != 0]
+            if len(lora_list) != 0:
+                patcher_lora = patcher.clone()
 
-        if not gguf:
-            if lora is not None and merge_loras:
-                if not lora_low_mem_load:
-                    load_weights(transformer, sd, weight_dtype, base_dtype, transformer_load_device)
+                def deep_copy_attribute(object, attr_name: str, default_val):
+                    if attr_name in object:
+                        object[attr_name] = object[attr_name].copy()
+                    else:
+                        object[attr_name] = default_val
+                deep_copy_attribute(patcher_lora.attachments, "_lora_dict", {})
 
-                if control_lora:
-                    patch_control_lora(patcher.model.diffusion_model, device)
-                    patcher.model.is_patched = True
+                loaded_lora_list = []
+                for l in lora_list:
+                    lora_name, lora_path, strength_model = l["name"], l["path"], l["strength"]
+                    if validators.url(lora_name):
+                        lora_weight = lora_name
+                    else:
+                        lora_weight = load_torch_file(lora_path, safe_load=True)
+                    loaded_lora = (lora_name, lora_weight, strength_model, 0)
+                    loaded_lora_list.append(loaded_lora)
+                    loguru.logger.info(
+                        f"Applied lora {lora_name} with strength {strength_model} to model (instance {self.instance_id})"
+                    )
+                patcher_lora.attachments["_lora_dict"][self.instance_id] = loaded_lora_list
+                del patcher
+                patcher = patcher_lora
 
-                log.info("Merging LoRA to the model...")
-                patcher = apply_lora(
-                    patcher, device, transformer_load_device, params_to_keep=params_to_keep, dtype=weight_dtype, base_dtype=base_dtype, state_dict=sd,
-                    low_mem_load=lora_low_mem_load, control_lora=control_lora, scale_weights=scale_weights)
-                if not control_lora:
-                    scale_weights.clear()
-                    patcher.patches.clear()
-                transformer.patched_linear = False
-                sd = None
-            elif "scaled" in quantization or lora is not None:
-                transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights, compile_args=compile_args)
-                transformer.patched_linear = True
+        # if lora is not None:
+        #     patcher, control_lora, unianimate_sd = add_lora_weights(patcher, lora, base_dtype, merge_loras=merge_loras)
+        #     if unianimate_sd is not None:
+        #         log.info("Merging UniAnimate weights to the model...")
+        #         sd.update(unianimate_sd)
+        #         del unianimate_sd
 
-        if "fast" in quantization:
-            if lora is not None and not merge_loras:
-                raise NotImplementedError("fp8_fast is not supported with unmerged LoRAs")
-            from .fp8_optimization import convert_fp8_linear
-            convert_fp8_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
+        # if not gguf:
+        #     if lora is not None and merge_loras:
+        #         if not lora_low_mem_load:
+        #             load_weights(transformer, sd, weight_dtype, base_dtype, transformer_load_device)
+
+        #         if control_lora:
+        #             patch_control_lora(patcher.model.diffusion_model, device)
+        #             patcher.model.is_patched = True
+
+        #         log.info("Merging LoRA to the model...")
+        #         patcher = apply_lora(
+        #             patcher, device, transformer_load_device, params_to_keep=params_to_keep, dtype=weight_dtype, base_dtype=base_dtype, state_dict=sd,
+        #             low_mem_load=lora_low_mem_load, control_lora=control_lora, scale_weights=scale_weights)
+        #         if not control_lora:
+        #             scale_weights.clear()
+        #             patcher.patches.clear()
+        #         transformer.patched_linear = False
+        #         sd = None
+        #     elif "scaled" in quantization or lora is not None:
+        #         transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights, compile_args=compile_args)
+        #         transformer.patched_linear = True
+
+        # if "fast" in quantization:
+        #     if lora is not None and not merge_loras:
+        #         raise NotImplementedError("fp8_fast is not supported with unmerged LoRAs")
+        #     from .fp8_optimization import convert_fp8_linear
+        #     convert_fp8_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
 
         if vram_management_args is not None:
             if gguf:
@@ -1951,15 +1947,15 @@ class WanVideoModelLoader:
                 compile_args = compile_args,
             )
 
-        if merge_loras and lora is not None:
-            # Skip offloading if load_device is main_device (for unified memory systems like AMD Strix Halo)
-            if load_device != "main_device":
-                log.info(f"Moving diffusion model from {patcher.model.diffusion_model.device} to {offload_device}")
-                patcher.model.diffusion_model.to(offload_device)
-                gc.collect()
-                mm.soft_empty_cache()
-            else:
-                log.info(f"Skipping offload (load_device=main_device, keeping model on {patcher.model.diffusion_model.device})")
+        # if merge_loras and lora is not None:
+        #     # Skip offloading if load_device is main_device (for unified memory systems like AMD Strix Halo)
+        #     if load_device != "main_device":
+        #         log.info(f"Moving diffusion model from {patcher.model.diffusion_model.device} to {offload_device}")
+        #         patcher.model.diffusion_model.to(offload_device)
+        #         gc.collect()
+        #         mm.soft_empty_cache()
+        #     else:
+        #         log.info(f"Skipping offload (load_device=main_device, keeping model on {patcher.model.diffusion_model.device})")
 
         patcher.model["base_dtype"] = base_dtype
         patcher.model["weight_dtype"] = weight_dtype
@@ -1972,9 +1968,7 @@ class WanVideoModelLoader:
         patcher.model["gguf_reader"] = gguf_reader
         patcher.model["fp8_matmul"] = "fast" in quantization
         patcher.model["scale_weights"] = scale_weights
-        # patcher.model["sd"] = sd
-        patcher.model["sd"] = None
-        del sd
+        patcher.model["sd"] = sd
         patcher.model["lora"] = lora
 
         if 'transformer_options' not in patcher.model_options:
