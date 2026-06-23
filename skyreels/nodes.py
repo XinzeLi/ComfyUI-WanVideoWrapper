@@ -172,7 +172,7 @@ class WanVideoDiffusionForcingSampler:
 
         # Load weights
         if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0:
-            transformer = _replace_linear(transformer, dtype, patcher.model["sd"])
+            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], compile_args=model["compile_args"])
             transformer.patched_linear = True
         if patcher.model["sd"] is not None and gguf_reader is None:
             load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
@@ -548,7 +548,7 @@ class WanVideoDiffusionForcingSampler:
         gc.collect()
         try:
             torch.cuda.reset_peak_memory_stats(device)
-        except:
+        except Exception:
             pass
 
         #region main loop start
@@ -615,7 +615,7 @@ class WanVideoDiffusionForcingSampler:
         try:
             print_memory(device)
             torch.cuda.reset_peak_memory_stats(device)
-        except:
+        except Exception:
             pass
 
         return ({
